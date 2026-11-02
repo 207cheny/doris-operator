@@ -5,6 +5,14 @@
 
 ---
 
+## 摘要
+replicas 3 → 2 在代码里不是一个删除动作，而是一台一次只推进一格、可中断、可恢复的状态机。它的做法是先把 StatefulSet 的自动缩容能力"关掉"，再由 Operator 手动完成：
+
+每轮把 st.replicas 改回 live 值，并把更新策略切成 OnDelete —— 副本数不提前收缩，K8s 也不自动删 Pod；
+只挑最高 ordinal 的那个 Pod，先写终止哨兵、再 stop_be.sh --grace 排空，等容器退出（或超时 200s）；
+容器退出后 DROP BACKEND → 删 Pod → 才把 replicas 降到该 Pod 的 ordinal。
+进度全部存在 STS 注解 doris.disaggregated.cluster/graceful-action 里，所以 Operator 进程重启后能从断点继续。
+
 ## 0 前提
 
 **范围**：只分析存算分离 `DorisDisaggregatedCluster` 下 ComputeGroup 的**优雅缩容 3→2**。decommission、升级、删除 ComputeGroup 均不在范围内。
