@@ -95,7 +95,9 @@ func (dcgs *DisaggregatedComputeGroupsController) gracefulRolloutReconcile(
 	cgStatus.GracefulAction = nil
 
 	// Determine what graceful action is needed.
+	// 构建新的GracefulAction
 	action := dcgs.detectGracefulAction(st, est, cgStatus)
+	// 从注解恢复旧状态
 	storedAction, err := getGracefulAction(est)
 	if err != nil {
 		return true, err
@@ -112,21 +114,26 @@ func (dcgs *DisaggregatedComputeGroupsController) gracefulRolloutReconcile(
 			klog.Infof("gracefulRolloutReconcile: updating scale-down target for cg=%s to %d", cg.UniqueId, requestedReplicas)
 			storedAction.DesiredReplicas = &requestedReplicas
 		}
+		// 唯一可以取消缩容的时机：期望副本数高于线上（正常缩容），且当前没有 Pod 被选中/drain
 		if requestedReplicas >= currentReplicas && !gracefulScaleDownPodStarted(storedAction) {
 			klog.Infof("gracefulRolloutReconcile: cancelling scale-down for cg=%s because requested replicas=%d current replicas=%d",
 				cg.UniqueId, requestedReplicas, currentReplicas)
 			cgStatus.Phase = dv1.Reconciling
+			// 移除GracefulAction注解
 			if err := dcgs.finalizeGracefulAction(ctx, st); err != nil {
 				return true, err
 			}
 			return false, nil
 		}
+		// 否则缩容继续执行。要么期望副本数仍低于线上（正常缩容），
+		// 要么已有 Pod 被选中/drain，必须先把它跑完，才能按新目标收尾。
 	}
 
 	// If we have a new action and no existing action, store the action first.
 	// For rolling updates this lets the new StatefulSet template be applied with
 	// OnDelete before any pod is deleted.
 	if action != nil && storedAction == nil {
+		// 预先检查待缩容的容器是否支持哨兵配置
 		supported, reason := dcgs.supportsTerminatingSentinel(ctx, restConfig, cluster, cg, cgStatus, est, action)
 		if !supported {
 			klog.Warningf("gracefulRolloutReconcile: graceful action disabled for cg=%s type=%s: %s", cg.UniqueId, action.Type, reason)
@@ -145,12 +152,16 @@ func (dcgs *DisaggregatedComputeGroupsController) gracefulRolloutReconcile(
 		klog.Infof("gracefulRolloutReconcile: starting graceful action type=%s for cg=%s", action.Type, cg.UniqueId)
 		dcgs.K8srecorder.Eventf(cluster, string(sc.EventNormal), string(sc.GracefulDrainStarted),
 			"Starting graceful %s for compute group %s", action.Type, cg.UniqueId)
+		// 核心逻辑：sts先保持原始副本数，防止k8s控制器自动缩容。
+		// 确保更新策略为OnDelete
 		prepareGracefulStatefulSet(st, est, action)
+		// 写回注解
 		setGracefulAction(st, action)
 		return true, nil
 	}
 
 	// If there's a higher-priority action pending, abort current.
+	// 如果新的action优先级更高，storedAction被覆盖
 	if action != nil && storedAction != nil && action.Type != storedAction.Type {
 		if gracefulActionPriority(action.Type) > gracefulActionPriority(storedAction.Type) {
 			klog.Infof("gracefulRolloutReconcile: aborting %s in favor of higher-priority %s for cg=%s",
@@ -178,6 +189,7 @@ func (dcgs *DisaggregatedComputeGroupsController) gracefulRolloutReconcile(
 	}
 
 	// Run the state machine.
+	// 状态机核心逻辑
 	err = dcgs.runGracefulStateMachine(ctx, restConfig, cluster, cg, cgStatus, est, ga)
 	if err != nil {
 		ga.LastMessage = err.Error()
@@ -225,6 +237,7 @@ func (dcgs *DisaggregatedComputeGroupsController) detectGracefulAction(
 	cgStatus *dv1.ComputeGroupStatus,
 ) *dv1.GracefulAction {
 	// Check for scale down: desired replicas < existing replicas.
+	// 期望值小于实际值，说明有 Pod 被缩容了
 	if *st.Spec.Replicas < *est.Spec.Replicas {
 		desiredReplicas := *st.Spec.Replicas
 		return &dv1.GracefulAction{
@@ -237,6 +250,7 @@ func (dcgs *DisaggregatedComputeGroupsController) detectGracefulAction(
 	// Check for rolling update before applying the new template. Waiting for
 	// UpdateRevision != CurrentRevision is too late because native RollingUpdate
 	// may have already started deleting pods.
+	// 若配置发生变化，进入优雅状态机，规避k8s自动缩容
 	if dcgs.statefulSetSpecChanged(st, est) {
 		return &dv1.GracefulAction{
 			Type:  dv1.GracefulActionRollingUpdate,
@@ -245,6 +259,8 @@ func (dcgs *DisaggregatedComputeGroupsController) detectGracefulAction(
 	}
 
 	// Recover an already-applied OnDelete update.
+	// 这是"断点续跑"分支,模板已经apply（statefulSetSpecChanged 已为 false），
+	// 但还有 Pod 停在旧 revision，需要重新建一个 RollingUpdate 动作把它做完
 	if est.Status.UpdateRevision != "" && est.Status.UpdateRevision != est.Status.CurrentRevision {
 		recoverAction := &dv1.GracefulAction{
 			Type:           dv1.GracefulActionRollingUpdate,
@@ -270,8 +286,10 @@ func (dcgs *DisaggregatedComputeGroupsController) runGracefulStateMachine(
 	est *appv1.StatefulSet,
 	ga *dv1.GracefulAction,
 ) error {
+	// 状态分发：判断当前 reconcile 正在执行优雅状态机哪一步
 	switch ga.Phase {
 	case dv1.GracefulPhaseTriggerDrain:
+		// 哨兵+stop_be,触发BE容器主动停机
 		return dcgs.handleTriggerDrain(ctx, restConfig, cluster, cg, cgStatus, est, ga)
 	case dv1.GracefulPhaseWaitDrain:
 		return dcgs.handleWaitDrain(ctx, cluster, cg, cgStatus, ga)
@@ -318,6 +336,8 @@ func (dcgs *DisaggregatedComputeGroupsController) handleTriggerDrain(
 			ga.Phase = dv1.GracefulPhaseDone
 			return nil
 		}
+		// 选中的 Pod，对缩容而言它是高于期望副本数的最大序号，
+		// 即将被删除的那个 Pod
 		ga.CurrentPod = podName
 		ga.CurrentOrdinal = ordinal
 		ga.DrainTriggered = false
@@ -340,6 +360,7 @@ func (dcgs *DisaggregatedComputeGroupsController) handleTriggerDrain(
 	}
 
 	// Record the initial restart count of the BE container.
+	// 填充新一轮的gracefulAction
 	ga.InitialRestartCount = getContainerRestartCount(pod, beMainContainerName)
 	ga.InitialPodUID = string(pod.UID)
 	ga.InitialContainerID = getContainerID(pod, beMainContainerName)
@@ -380,6 +401,7 @@ func (dcgs *DisaggregatedComputeGroupsController) handleTriggerDrain(
 	// Write the terminating sentinel first, so a kubelet-triggered restart inside the same
 	// terminating pod exits before starting a new BE generation.
 	if !ga.DrainTriggered {
+		// 创建哨兵文件
 		sentinelStdout, sentinelStderr, sentinelErr := execInPod(ctx, restConfig,
 			cluster.Namespace, ga.CurrentPod, beMainContainerName,
 			[]string{"sh", "-c", fmt.Sprintf("mkdir -p %s && touch %s", gracefulRuntimeMountPath, beTerminatingSentinelPath)},
@@ -395,6 +417,7 @@ func (dcgs *DisaggregatedComputeGroupsController) handleTriggerDrain(
 
 		klog.Infof("handleTriggerDrain: executing stop_be.sh --grace on pod %s uid=%s containerID=%s oldStartTime=%s oldEpoch=%s sentinelWritten=%t",
 			ga.CurrentPod, ga.InitialPodUID, ga.InitialContainerID, ga.InitialBackendStartTime, ga.InitialBackendEpoch, ga.SentinelWritten)
+		// 执行stop_be.sh动作，使容器进程主动退出
 		stdout, stderr, execErr := execInPod(ctx, restConfig,
 			cluster.Namespace, ga.CurrentPod, beMainContainerName,
 			[]string{stopBEGraceCommand, stopBEGraceArg},
@@ -491,6 +514,8 @@ func (dcgs *DisaggregatedComputeGroupsController) handleDeletePod(
 	ga *dv1.GracefulAction,
 ) error {
 	if ga.Type == dv1.GracefulActionScaleDown {
+		// 缩容时先从 FE 摘除该 BE（DROP BACKEND），再删除 Pod，
+		// 保证 FE 在 Pod 消失前就停止向该 BE 路由查询。
 		if err := dcgs.dropBackendByPodName(ctx, cluster, cgStatus, ga.CurrentPod); err != nil {
 			return fmt.Errorf("failed to drop backend for scale-down pod %s: %w", ga.CurrentPod, err)
 		}

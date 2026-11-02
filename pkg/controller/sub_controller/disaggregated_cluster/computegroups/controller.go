@@ -91,7 +91,7 @@ func (dcgs *DisaggregatedComputeGroupsController) Sync(ctx context.Context, obj 
 	var errs []error
 	cgs := ddc.Spec.ComputeGroups
 	for i, _ := range cgs {
-
+		// 单个计算组同步的入口
 		if event, err := dcgs.computeGroupSync(ctx, ddc, &cgs[i]); err != nil {
 			if event != nil {
 				dcgs.K8srecorder.Event(ddc, string(event.Type), string(event.Reason), event.Message)
@@ -149,8 +149,12 @@ func (dcgs *DisaggregatedComputeGroupsController) computeGroupSync(ctx context.C
 	if cg.Replicas == nil {
 		cg.Replicas = resource.GetInt32Pointer(1)
 	}
+	// 根据 reconcileStatefulset 里的desiredReplicas期望值/liveReplicas实际值 ，
+	// 判断该计算组当前是在缩容、扩容、同步状态。
 	cvs := dcgs.GetConfigValuesFromConfigMaps(ddc.Namespace, resource.BE_RESOLVEKEY, cg.CommonSpec.ConfigMaps)
 	st := dcgs.NewStatefulset(ddc, cg, cvs)
+	// headless service 提供稳定独立的DNS地址，如<pod>.<ddc>-<cg>.<ns>.svc.cluster.local
+	// FE可以通过这个服务分配流量
 	internalSvc := dcgs.newInternalService(ddc, cg, cvs)
 	externalSvc := dcgs.newExternalService(ddc, cg, cvs)
 	dcgs.initialCGStatus(ddc, cg)
@@ -172,7 +176,7 @@ func (dcgs *DisaggregatedComputeGroupsController) computeGroupSync(ctx context.C
 		klog.Errorf("disaggregatedComputeGroupsController reconcile external service namespace %s name %s failed, err=%s", externalSvc.Namespace, externalSvc.Name, err.Error())
 		return event, err
 	}
-
+	// 对账 StatefulSet。优雅缩容状态机（或 legacy 下线路径）就是从这里进入的。
 	event, err = dcgs.reconcileStatefulset(ctx, st, ddc, cg)
 	if err != nil {
 		klog.Errorf("disaggregatedComputeGroupsController reconcile statefulset namespace %s name %s failed, err=%s", st.Namespace, st.Name, err.Error())
@@ -255,10 +259,12 @@ func (dcgs *DisaggregatedComputeGroupsController) reconcileStatefulset(ctx conte
 	// supports it. Decommissioning keeps the legacy pre-apply ordering.
 	gracefulInProgress := false
 	if !cluster.Spec.EnableDecommission {
+		// 核心缩容开始（哨兵+优雅停止脚本）
 		gracefulInProgress = dcgs.reconcileGracefulStatefulSet(ctx, st, &est, cluster, cg)
 	}
 
 	if !gracefulInProgress {
+		// （不在本次优雅缩容范围）优雅状态机未接管，直接执行 DropBE 从FE摘除BE
 		err := dcgs.preApplyStatefulSet(ctx, st, &est, cluster, cg)
 		if err != nil {
 			klog.Errorf("disaggregatedComputeGroupsController reconcileStatefulset preApplyStatefulSet namespace=%s name=%s failed, err=%s", st.Namespace, st.Name, err.Error())
@@ -276,6 +282,8 @@ func (dcgs *DisaggregatedComputeGroupsController) reconcileStatefulset(ctx conte
 	}
 
 	if st.Spec.UpdateStrategy.Type == appv1.OnDeleteStatefulSetStrategyType {
+		// OnDelete 会在 live 对象上残留 rollingUpdate 字段：merge patch 无法删除它
+		// （omitempty 会把 nil key 丢弃）。这里显式清除，保证落盘的 StatefulSet 保持干净。
 		dcgs.clearStatefulSetRollingUpdate(ctx, st.Namespace, st.Name)
 	}
 	if err := k8s.ApplyStatefulSet(ctx, dcgs.K8sclient, st, func(new, est *appv1.StatefulSet) bool {
@@ -312,6 +320,8 @@ func (dcgs *DisaggregatedComputeGroupsController) reconcileGracefulStatefulSet(
 	cg *dv1.ComputeGroup,
 ) bool {
 	if dcgs.RestConfig == nil {
+		// 优雅动作需要 exec 进入 Pod 的权限，没有 RestConfig 就完全无法执行。
+		// 必须打日志说明，否则无从排查"优雅缩容为什么没生效"。
 		return false
 	}
 	var cgStatus *dv1.ComputeGroupStatus
@@ -322,6 +332,7 @@ func (dcgs *DisaggregatedComputeGroupsController) reconcileGracefulStatefulSet(
 		}
 	}
 	if cgStatus == nil {
+		// 计算组状态尚未初始化，优雅状态机没有可以持久化状态的地方
 		return false
 	}
 
